@@ -1,127 +1,325 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
+﻿
+using SQLite;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace RSVPApp;
 
-// Hard-coded user information for Week 2.
-public static class Session
-{
-    public static bool IsGuest { get; set; } = true;
+// SQLITE DATABASE TABLES
 
-    public const string Name = "Dalvin Wolff";
-    public const string Email = "dalvin@example.com";
-    public const string Password = "Welcome123!";
-    public const string Phone = "555-0100";
+[Table("Users")]
+public class UserRecord
+{
+    [PrimaryKey, AutoIncrement]
+    public int Id { get; set; }
+
+    [Unique, NotNull]
+    public string Email { get; set; } = "";
+
+    public string Name { get; set; } = "";
+    public string Phone { get; set; } = "";
+    public string PasswordHash { get; set; } = "";
 }
 
-// Event information displayed by the application.
-public class EventInfo
+[Table("Events")]
+public class EventRecord
 {
+    [PrimaryKey, AutoIncrement]
+    public int Id { get; set; }
+
+    [Indexed]
+    public int HostUserId { get; set; }
+
     public string Name { get; set; } = "";
-    public string Host { get; set; } = "";
     public string Address { get; set; } = "";
     public string Description { get; set; } = "";
-
     public DateTime Date { get; set; }
     public DateTime Deadline { get; set; }
-
     public int Capacity { get; set; }
-    public bool Attending { get; set; }
-    public bool Hosting { get; set; }
-
-    public List<string> Accepted { get; set; } = new();
-    public List<string> Pending { get; set; } = new();
-
-    public string ImageName { get; set; } = "dotnet_bot.png";
 }
 
-// Shared sample events.
-public static class SampleData
+[Table("RSVPs")]
+public class RsvpRecord
 {
-    public static List<EventInfo> Events { get; } = new()
+    [PrimaryKey, AutoIncrement]
+    public int Id { get; set; }
+
+    [Indexed]
+    public int EventId { get; set; }
+
+    [Indexed]
+    public int UserId { get; set; }
+
+    public string Name { get; set; } = "";
+    public string Email { get; set; } = "";
+    public string Phone { get; set; } = "";
+    public string Status { get; set; } = "Accepted";
+}
+
+// DATABASE ACCESS
+
+public static class Store
+{
+    private static SQLiteAsyncConnection? connection;
+    private static readonly SemaphoreSlim gate = new(1, 1);
+
+    public static UserRecord? CurrentUser { get; set; }
+    public static bool Guest => CurrentUser == null;
+
+    private static async Task<SQLiteAsyncConnection> Db()
     {
-        new EventInfo
-        {
-            Name = "Community Game Night",
-            Host = Session.Name,
-            Address = "100 Main Street, Richmond, VA",
-            Description =
-                "Join us for board games, snacks, and a relaxed evening. " +
-                "Bring your favorite game if you would like.",
-            Date = DateTime.Today.AddDays(14).AddHours(18),
-            Deadline = DateTime.Today.AddDays(12).AddHours(23),
-            Capacity = 20,
-            Attending = true,
-            Hosting = true,
-            Accepted = new List<string>
-            {
-                Session.Name,
-                "Jordan Smith",
-                "Alex Johnson"
-            },
-            Pending = new List<string>
-            {
-                "Taylor Brown",
-                "Morgan Lee"
-            }
-        },
+        if (connection != null)
+            return connection;
 
-        new EventInfo
-        {
-            Name = "Weekend Picnic",
-            Host = "Jordan Smith",
-            Address = "250 Park Avenue, Richmond, VA",
-            Description =
-                "An afternoon picnic at the park. Bring a chair and water.",
-            Date = DateTime.Today.AddDays(21).AddHours(12),
-            Deadline = DateTime.Today.AddDays(19).AddHours(23),
-            Capacity = 30,
-            Attending = false,
-            Hosting = false,
-            Accepted = new List<string>
-            {
-                "Jordan Smith"
-            }
-        },
+        await gate.WaitAsync();
 
-        new EventInfo
+        try
         {
-            Name = "Study Meetup",
-            Host = "Alex Johnson",
-            Address = "75 Library Lane, Richmond, VA",
-            Description =
-                "A completed study meetup for reviewing programming concepts.",
-            Date = DateTime.Today.AddDays(-7).AddHours(15),
-            Deadline = DateTime.Today.AddDays(-9),
-            Capacity = 10,
-            Attending = true,
-            Hosting = false,
-            Accepted = new List<string>
+            if (connection == null)
             {
-                Session.Name,
-                "Alex Johnson"
+                var path = Path.Combine(
+                    FileSystem.AppDataDirectory, "rsvp.db3");
+
+                var db = new SQLiteAsyncConnection(path);
+
+                await db.CreateTableAsync<UserRecord>();
+                await db.CreateTableAsync<EventRecord>();
+                await db.CreateTableAsync<RsvpRecord>();
+
+                connection = db;
             }
         }
-    };
-}
-
-// Shared helpers for building the pages.
-public static class Ui
-{
-    public static Label Heading(string text)
-    {
-        return new Label
+        finally
         {
-            Text = text,
-            FontSize = 24,
-            FontAttributes = FontAttributes.Bold
-        };
+            gate.Release();
+        }
+
+        return connection!;
     }
 
-    public static Button Action(
+    private static string Hash(
+        string password, byte[]? salt = null)
+    {
+        salt ??= RandomNumberGenerator.GetBytes(16);
+
+        var derived = Rfc2898DeriveBytes.Pbkdf2(
+            password, salt, 120000,
+            HashAlgorithmName.SHA256, 32);
+
+        return Convert.ToBase64String(salt) + ":" +
+               Convert.ToBase64String(derived);
+    }
+
+    public static async Task<string?> Register(
+        string name, string email,
+        string password, string phone)
+    {
+        email = email.Trim().ToLowerInvariant();
+
+        if (string.IsNullOrWhiteSpace(name) ||
+            string.IsNullOrWhiteSpace(phone) ||
+            !email.Contains('@') ||
+            password.Length < 8)
+        {
+            return "Complete all fields with a valid email and password of at least 8 characters.";
+        }
+
+        var db = await Db();
+
+        var existing = await db.Table<UserRecord>()
+            .Where(x => x.Email == email)
+            .FirstOrDefaultAsync();
+
+        if (existing != null)
+            return "That email is already registered.";
+
+        try
+        {
+            await db.InsertAsync(new UserRecord
+            {
+                Name = name.Trim(),
+                Email = email,
+                Phone = phone.Trim(),
+                PasswordHash = Hash(password)
+            });
+        }
+        catch (SQLiteException)
+        {
+            return "Unable to save account.";
+        }
+
+        return null;
+    }
+
+    public static async Task<bool> Login(
+        string email, string password)
+    {
+        var db = await Db();
+
+        var user = await db.Table<UserRecord>()
+            .Where(x =>
+                x.Email == email.Trim().ToLowerInvariant())
+            .FirstOrDefaultAsync();
+
+        if (user == null)
+            return false;
+
+        var pieces = user.PasswordHash.Split(':');
+
+        if (pieces.Length != 2)
+            return false;
+
+        try
+        {
+            var salt = Convert.FromBase64String(pieces[0]);
+            var actual = Convert.FromBase64String(pieces[1]);
+
+            var test = Rfc2898DeriveBytes.Pbkdf2(
+                password, salt, 120000,
+                HashAlgorithmName.SHA256, 32);
+
+            if (!CryptographicOperations.FixedTimeEquals(
+                actual, test))
+                return false;
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+
+        CurrentUser = user;
+        return true;
+    }
+
+    public static async Task<int> AddEvent(
+        EventRecord item)
+    {
+        var db = await Db();
+
+        await db.InsertAsync(item);
+
+        return item.Id;
+    }
+
+    public static async Task<List<EventRecord>> Events()
+    {
+        return await (await Db())
+            .Table<EventRecord>()
+            .ToListAsync();
+    }
+
+    public static async Task<List<RsvpRecord>> Rsvps(
+        int eventId)
+    {
+        return await (await Db())
+            .Table<RsvpRecord>()
+            .Where(x => x.EventId == eventId)
+            .ToListAsync();
+    }
+
+    public static async Task<bool> Attending(
+        int eventId, int userId)
+    {
+        return await (await Db())
+            .Table<RsvpRecord>()
+            .Where(x =>
+                x.EventId == eventId &&
+                x.UserId == userId &&
+                x.Status == "Accepted")
+            .CountAsync() > 0;
+    }
+
+    public static async Task<string?> SaveRsvp(
+        EventRecord item,
+        string name, string email, string phone)
+    {
+        if (item.Date <= DateTime.Now ||
+            item.Deadline.Date < DateTime.Today)
+            return "RSVP is closed.";
+
+        var db = await Db();
+        var rsvps = await Rsvps(item.Id);
+
+        var normalizedEmail =
+            email.Trim().ToLowerInvariant();
+
+        int userId = CurrentUser?.Id ?? 0;
+
+        var existing = rsvps.FirstOrDefault(x =>
+            userId > 0
+                ? x.UserId == userId
+                : x.Email == normalizedEmail);
+
+        if (existing == null &&
+            rsvps.Count(x =>
+                x.Status == "Accepted") >= item.Capacity)
+        {
+            return "Event is full.";
+        }
+
+        var record = existing ?? new RsvpRecord
+        {
+            EventId = item.Id,
+            UserId = userId
+        };
+
+        record.Name = name.Trim();
+        record.Email = normalizedEmail;
+        record.Phone = phone.Trim();
+        record.Status = "Accepted";
+
+        if (existing == null)
+            await db.InsertAsync(record);
+        else
+            await db.UpdateAsync(record);
+
+        return null;
+    }
+
+    public static async Task<string> HostName(int id)
+    {
+        var user = await (await Db())
+            .Table<UserRecord>()
+            .Where(x => x.Id == id)
+            .FirstOrDefaultAsync();
+
+        return user?.Name ?? "Unknown";
+    }
+}
+
+// UI HELPERS
+
+public static class Ui
+{
+    public static VerticalStackLayout Stack() =>
+        new()
+        {
+            Padding = 20,
+            Spacing = 12
+        };
+
+    public static Label Heading(string text) =>
+        new()
+        {
+            Text = text,
+            FontSize = 23,
+            FontAttributes = FontAttributes.Bold
+        };
+
+    public static Label Text(string text) =>
+        new() { Text = text };
+
+    public static Entry Entry(
+        string hint, bool secret = false) =>
+        new()
+        {
+            Placeholder = hint,
+            IsPassword = secret
+        };
+
+    public static Button Button(
         string text,
-        Action clicked,
+        Func<Task> action,
         bool green = false)
     {
         var button = new Button
@@ -131,85 +329,70 @@ public static class Ui
                 green ? "#218653" : "#153454")
         };
 
-        button.Clicked += (_, _) => clicked();
+        button.Clicked += async (_, _) =>
+        {
+            button.IsEnabled = false;
+
+            try
+            {
+                await action();
+            }
+            finally
+            {
+                button.IsEnabled = true;
+            }
+        };
 
         return button;
     }
 
-    public static VerticalStackLayout Stack()
-    {
-        return new VerticalStackLayout
-        {
-            Padding = new Thickness(20),
-            Spacing = 14
-        };
-    }
+    public static ScrollView View(
+        VerticalStackLayout stack) =>
+        new() { Content = stack };
 
-    public static View Form(VerticalStackLayout stack)
-    {
-        return new ScrollView
-        {
-            Content = stack
-        };
-    }
-
-    public static bool Missing(params Entry[] fields)
-    {
-        return fields.Any(
-            field => string.IsNullOrWhiteSpace(field.Text));
-    }
-
-    public static Label FieldLabel(string text)
-    {
-        return new Label
-        {
-            Text = text,
-            FontAttributes = FontAttributes.Bold
-        };
-    }
-
-    public static void AddField(
+    public static void Field(
         VerticalStackLayout stack,
         string label,
         View field)
     {
-        stack.Children.Add(FieldLabel(label));
+        stack.Children.Add(new Label
+        {
+            Text = label,
+            FontAttributes = FontAttributes.Bold
+        });
+
         stack.Children.Add(field);
     }
 
-    // Corrected image method.
-    public static Image EventImage(EventInfo item)
-    {
-        var image = new Image
+    public static bool Empty(params Entry[] entries) =>
+        entries.Any(x =>
+            string.IsNullOrWhiteSpace(x.Text));
+
+    public static Label Placeholder() =>
+        new()
         {
-            Source = item.ImageName,
-            HeightRequest = 150,
-            Aspect = Aspect.AspectFit,
-            BackgroundColor = Color.FromArgb("#E4EDF5")
+            Text = "EVENT",
+            HeightRequest = 90,
+            BackgroundColor =
+                Color.FromArgb("#DDE9F4"),
+            HorizontalTextAlignment =
+                TextAlignment.Center,
+            VerticalTextAlignment =
+                TextAlignment.Center,
+            FontAttributes =
+                FontAttributes.Bold
         };
-
-        SemanticProperties.SetDescription(
-            image,
-            "Placeholder event image");
-
-        return image;
-    }
 }
 
 // LOGIN PAGE
+
 public partial class MainPage : ContentPage
 {
-    private readonly Entry email = new()
-    {
-        Placeholder = "Email",
-        Keyboard = Keyboard.Email
-    };
+    private readonly Entry email =
+        Ui.Entry("Email");
 
-    private readonly Entry password = new()
-    {
-        Placeholder = "Password",
-        IsPassword = true
-    };
+    private readonly Entry password =
+        Ui.Entry("Password", true);
 
     public MainPage()
     {
@@ -220,109 +403,62 @@ public partial class MainPage : ContentPage
         stack.Children.Add(
             Ui.Heading("Welcome to RSVP"));
 
-        stack.Children.Add(new Label
+        stack.Children.Add(
+            Ui.Text("Find events and manage your invitations."));
+
+        Ui.Field(stack, "Email", email);
+        Ui.Field(stack, "Password", password);
+
+        stack.Children.Add(Ui.Button("Login", async () =>
         {
-            Text = "Find events and manage your invitations."
-        });
-
-        Ui.AddField(stack, "Email", email);
-        Ui.AddField(stack, "Password", password);
-
-        stack.Children.Add(
-            Ui.Action("Login", Login));
-
-        stack.Children.Add(
-            Ui.Action("Continue as Guest", Guest));
-
-        stack.Children.Add(
-            Ui.Action("Create Account", async () =>
+            if (Ui.Empty(email, password))
             {
-                await Navigation.PushAsync(new AddUserPage());
+                await DisplayAlert(
+                    "Missing Information",
+                    "Enter your email and password.",
+                    "OK");
+                return;
+            }
+
+            bool valid = await Store.Login(
+                email.Text!, password.Text!);
+
+            if (!valid)
+            {
+                await DisplayAlert(
+                    "Login Failed",
+                    "Incorrect email or password.",
+                    "OK");
+                return;
+            }
+
+            password.Text = "";
+
+            await Navigation.PushAsync(new HomePage());
+        }));
+
+        stack.Children.Add(
+            Ui.Button("Continue as Guest", async () =>
+            {
+                Store.CurrentUser = null;
+
+                await Navigation.PushAsync(
+                    new HomePage());
             }));
 
-        stack.Children.Add(new Label
-        {
-            Text =
-                "Demo login:\n" +
-                "dalvin@example.com\n" +
-                "Welcome123!",
-            FontSize = 14,
-            TextColor = Colors.Gray
-        });
+        stack.Children.Add(
+            Ui.Button("Create Account", async () =>
+                await Navigation.PushAsync(
+                    new AddUserPage())));
 
-        Content = Ui.Form(stack);
-    }
-
-    private async void Login()
-    {
-        if (Ui.Missing(email, password))
-        {
-            await DisplayAlert(
-                "Missing Information",
-                "Enter your email and password.",
-                "OK");
-
-            return;
-        }
-
-        bool valid =
-            string.Equals(
-                email.Text.Trim(),
-                Session.Email,
-                StringComparison.OrdinalIgnoreCase)
-            && password.Text == Session.Password;
-
-        if (!valid)
-        {
-            await DisplayAlert(
-                "Login Failed",
-                "The email or password is incorrect.",
-                "OK");
-
-            return;
-        }
-
-        Session.IsGuest = false;
-        password.Text = "";
-
-        await Navigation.PushAsync(new HomePage());
-    }
-
-    private async void Guest()
-    {
-        Session.IsGuest = true;
-        password.Text = "";
-
-        await Navigation.PushAsync(new HomePage());
+        Content = Ui.View(stack);
     }
 }
 
-// ADD USER PAGE
+// ACCOUNT REGISTRATION
+
 public class AddUserPage : ContentPage
 {
-    private readonly Entry name = new()
-    {
-        Placeholder = "Full name"
-    };
-
-    private readonly Entry email = new()
-    {
-        Placeholder = "Email",
-        Keyboard = Keyboard.Email
-    };
-
-    private readonly Entry password = new()
-    {
-        Placeholder = "Password",
-        IsPassword = true
-    };
-
-    private readonly Entry phone = new()
-    {
-        Placeholder = "Mobile phone",
-        Keyboard = Keyboard.Telephone
-    };
-
     public AddUserPage()
     {
         Title = "Create Account";
@@ -332,69 +468,78 @@ public class AddUserPage : ContentPage
         stack.Children.Add(
             Ui.Heading("Create Account"));
 
-        Ui.AddField(stack, "Name", name);
-        Ui.AddField(stack, "Email", email);
-        Ui.AddField(stack, "Password", password);
-        Ui.AddField(stack, "Mobile Phone", phone);
+        var name = Ui.Entry("Full name");
+        var email = Ui.Entry("Email");
+        var pass = Ui.Entry("Password", true);
+        var phone = Ui.Entry("Mobile phone");
+
+        Ui.Field(stack, "Name", name);
+        Ui.Field(stack, "Email", email);
+        Ui.Field(stack, "Password (8+ characters)", pass);
+        Ui.Field(stack, "Mobile Phone", phone);
 
         stack.Children.Add(
-            Ui.Action("Add / OK", Validate, true));
-
-        stack.Children.Add(
-            Ui.Action("Cancel", async () =>
+            Ui.Button("Create Account", async () =>
             {
+                if (Ui.Empty(name, email, pass, phone))
+                {
+                    await DisplayAlert(
+                        "Missing Information",
+                        "Complete every field.",
+                        "OK");
+                    return;
+                }
+
+                var error = await Store.Register(
+                    name.Text!,
+                    email.Text!,
+                    pass.Text!,
+                    phone.Text!);
+
+                if (error != null)
+                {
+                    await DisplayAlert(
+                        "Cannot Register", error, "OK");
+                    return;
+                }
+
+                await DisplayAlert(
+                    "Saved",
+                    "Account saved to SQLite. Please log in.",
+                    "OK");
+
                 await Navigation.PopAsync();
-            }));
+            }, true));
 
-        Content = Ui.Form(stack);
-    }
+        stack.Children.Add(
+            Ui.Button("Cancel", async () =>
+                await Navigation.PopAsync()));
 
-    private async void Validate()
-    {
-        if (Ui.Missing(name, email, password, phone))
-        {
-            await DisplayAlert(
-                "Missing Information",
-                "Complete all account fields.",
-                "OK");
-
-            return;
-        }
-
-        await DisplayAlert(
-            "Validation Successful",
-            "All fields are complete. Account saving will be added later. " +
-            "Use the demo credentials to log in.",
-            "OK");
-
-        await Navigation.PopAsync();
+        Content = Ui.View(stack);
     }
 }
 
-// MAIN TABS
+// HOME TABS
+
 public class HomePage : TabbedPage
 {
     public HomePage()
     {
-        Title = Session.IsGuest
+        Title = Store.Guest
             ? "RSVP — Guest"
             : "RSVP";
 
-        BarBackgroundColor = Color.FromArgb("#153454");
-        SelectedTabColor = Colors.White;
-        UnselectedTabColor = Color.FromArgb("#B8CBDC");
+        BarBackgroundColor =
+            Color.FromArgb("#153454");
 
-        NavigationPage.SetHasBackButton(this, false);
+        SelectedTabColor = Colors.White;
 
         ToolbarItems.Add(new ToolbarItem
         {
-            Text = Session.IsGuest
-                ? "Exit Guest"
-                : "Logout",
-
+            Text = "Logout",
             Command = new Command(async () =>
             {
-                Session.IsGuest = true;
+                Store.CurrentUser = null;
 
                 await Navigation.PopToRootAsync();
             })
@@ -402,332 +547,161 @@ public class HomePage : TabbedPage
 
         Children.Add(new EventsPage());
         Children.Add(new InvitationsPage());
-        Children.Add(new EventsPage(past: true));
-    }
-
-    protected override bool OnBackButtonPressed()
-    {
-        Session.IsGuest = true;
-
-        return base.OnBackButtonPressed();
+        Children.Add(new EventsPage(true));
     }
 }
 
-// EVENTS AND PAST EVENTS
+// EVENTS LIST
+
 public class EventsPage : ContentPage
 {
     private readonly bool past;
     private string filter;
 
-    private readonly VerticalStackLayout list = new()
-    {
-        Spacing = 16
-    };
+    private readonly VerticalStackLayout list =
+        new() { Spacing = 14 };
 
     public EventsPage(bool past = false)
     {
         this.past = past;
 
-        filter = Session.IsGuest
+        filter = Store.Guest
             ? "All"
             : "Attending";
 
-        Title = past
-            ? "Past Events"
-            : "Events";
+        Title = past ? "Past Events" : "Events";
 
         var stack = Ui.Stack();
 
-        stack.Children.Add(
-            Ui.Heading(Title));
+        stack.Children.Add(Ui.Heading(Title));
 
         if (!past)
         {
-            var filters = new HorizontalStackLayout
+            var buttons = new HorizontalStackLayout
             {
-                Spacing = 8
+                Spacing = 5
             };
 
-            filters.Children.Add(
-                Ui.Action("All", () =>
-                {
-                    SetFilter("All");
-                }));
-
-            if (!Session.IsGuest)
+            foreach (var selected in Store.Guest
+                ? new[] { "All" }
+                : new[] { "All", "Attending", "Hosting" })
             {
-                filters.Children.Add(
-                    Ui.Action("Attending", () =>
+                buttons.Children.Add(
+                    Ui.Button(selected, async () =>
                     {
-                        SetFilter("Attending");
-                    }));
-
-                filters.Children.Add(
-                    Ui.Action("Hosting", () =>
-                    {
-                        SetFilter("Hosting");
+                        filter = selected;
+                        await Refresh();
                     }));
             }
 
             stack.Children.Add(new ScrollView
             {
                 Orientation = ScrollOrientation.Horizontal,
-                Content = filters
+                Content = buttons
             });
 
-            if (!Session.IsGuest)
+            if (!Store.Guest)
             {
                 stack.Children.Add(
-                    Ui.Action("Create Event", async () =>
-                    {
+                    Ui.Button("Create Event", async () =>
                         await Navigation.PushAsync(
-                            new AddEventPage());
-                    }, true));
+                            new AddEventPage()), true));
             }
         }
 
         stack.Children.Add(list);
 
-        Content = Ui.Form(stack);
-
-        Refresh();
+        Content = Ui.View(stack);
     }
 
-    private void SetFilter(string selected)
+    protected override async void OnAppearing()
     {
-        filter = selected;
+        base.OnAppearing();
 
-        Refresh();
+        await Refresh();
     }
 
-    private void Refresh()
+    private async Task Refresh()
     {
         list.Children.Clear();
 
-        IEnumerable<EventInfo> events = SampleData.Events;
-
-        events = past
-            ? events.Where(item => item.Date < DateTime.Now)
-            : events.Where(item => item.Date >= DateTime.Now);
-
-        if (past)
-        {
-            events = Session.IsGuest
-                ? Enumerable.Empty<EventInfo>()
-                : events.Where(
-                    item => item.Attending || item.Hosting);
-        }
-        else if (filter == "Attending")
-        {
-            events = events.Where(item => item.Attending);
-        }
-        else if (filter == "Hosting")
-        {
-            events = events.Where(item => item.Hosting);
-        }
-
-        list.Children.Add(new Label
-        {
-            Text = past
+        list.Children.Add(
+            Ui.Text(past
                 ? "Previous gatherings"
-                : $"Showing: {filter}",
+                : "Showing: " + filter));
 
-            FontAttributes = FontAttributes.Bold
-        });
+        var all = await Store.Events();
 
-        var results = events
-            .OrderBy(item => item.Date)
-            .ToList();
+        int currentId = Store.CurrentUser?.Id ?? 0;
+
+        var results = new List<EventRecord>();
+
+        foreach (var ev in all)
+        {
+            if (past != (ev.Date < DateTime.Now))
+                continue;
+
+            bool hosting =
+                currentId > 0 &&
+                ev.HostUserId == currentId;
+
+            bool attending =
+                currentId > 0 &&
+                await Store.Attending(ev.Id, currentId);
+
+            if (past &&
+                (Store.Guest || (!hosting && !attending)))
+                continue;
+
+            if (!past &&
+                filter == "Attending" && !attending)
+                continue;
+
+            if (!past &&
+                filter == "Hosting" && !hosting)
+                continue;
+
+            results.Add(ev);
+        }
 
         if (results.Count == 0)
         {
-            list.Children.Add(new Label
-            {
-                Text = Session.IsGuest && past
-                    ? "Log in to view events you hosted or attended."
-                    : "No events in this list."
-            });
+            list.Children.Add(Ui.Text(
+                "No events in this list. Try All or create an event."));
         }
 
-        foreach (var item in results)
+        foreach (var ev in results.OrderBy(x => x.Date))
         {
             var card = new VerticalStackLayout
             {
-                Spacing = 10,
-                Padding = 16,
+                Spacing = 8,
+                Padding = 12,
                 BackgroundColor = Colors.White
             };
 
-            card.Children.Add(
-                Ui.EventImage(item));
+            card.Children.Add(Ui.Placeholder());
+            card.Children.Add(Ui.Heading(ev.Name));
+
+            card.Children.Add(Ui.Text(
+                ev.Date.ToString(
+                    "MMMM d, yyyy • h:mm tt")));
+
+            card.Children.Add(Ui.Text(ev.Address));
 
             card.Children.Add(
-                Ui.Heading(item.Name));
-
-            card.Children.Add(new Label
-            {
-                Text = item.Date.ToString(
-                    "MMMM d, yyyy • h:mm tt")
-            });
-
-            card.Children.Add(new Label
-            {
-                Text = item.Address
-            });
-
-            card.Children.Add(
-                Ui.Action("View Details", async () =>
-                {
+                Ui.Button("View Details", async () =>
                     await Navigation.PushAsync(
-                        new EventDetailsPage(item));
-                }));
+                        new EventDetailsPage(ev))));
 
             list.Children.Add(card);
         }
     }
 }
 
-// EVENT DETAILS
-public class EventDetailsPage : ContentPage
-{
-    public EventDetailsPage(EventInfo item)
-    {
-        Title = "Event Details";
+// CREATE EVENT
 
-        var stack = Ui.Stack();
-
-        stack.Children.Add(
-            Ui.EventImage(item));
-
-        stack.Children.Add(
-            Ui.Heading(item.Name));
-
-        stack.Children.Add(new Label
-        {
-            Text = item.Description
-        });
-
-        stack.Children.Add(new Label
-        {
-            Text = $"Host: {item.Host}"
-        });
-
-        stack.Children.Add(new Label
-        {
-            Text = $"Address: {item.Address}"
-        });
-
-        stack.Children.Add(new Label
-        {
-            Text = $"Date: {item.Date:MMMM d, yyyy}"
-        });
-
-        stack.Children.Add(new Label
-        {
-            Text = $"Time: {item.Date:h:mm tt}"
-        });
-
-        stack.Children.Add(new Label
-        {
-            Text =
-                $"RSVP deadline: {item.Deadline:MMMM d, yyyy • h:mm tt}"
-        });
-
-        stack.Children.Add(new Label
-        {
-            Text =
-                $"Attendees: {item.Accepted.Count} / {item.Capacity}"
-        });
-
-        stack.Children.Add(
-            Ui.FieldLabel("Attending"));
-
-        foreach (string person in item.Accepted)
-        {
-            stack.Children.Add(new Label
-            {
-                Text = $"✓ {person} — Accepted",
-                TextColor = Color.FromArgb("#218653")
-            });
-        }
-
-        bool ended = item.Date <= DateTime.Now;
-        bool closed = item.Deadline < DateTime.Now;
-        bool full = item.Accepted.Count >= item.Capacity;
-
-        if (ended || closed || full)
-        {
-            stack.Children.Add(new Label
-            {
-                Text = ended
-                    ? "Event Ended"
-                    : full
-                        ? "Event Full"
-                        : "RSVP Closed",
-
-                FontAttributes = FontAttributes.Bold
-            });
-        }
-        else
-        {
-            stack.Children.Add(
-                Ui.Action("RSVP", async () =>
-                {
-                    await Navigation.PushAsync(
-                        new RsvpPage(item));
-                }, true));
-        }
-
-        stack.Children.Add(
-            Ui.Action("Back", async () =>
-            {
-                await Navigation.PopAsync();
-            }));
-
-        Content = Ui.Form(stack);
-    }
-}
-
-// ADD EVENT PAGE
 public class AddEventPage : ContentPage
 {
-    private readonly Entry host = new()
-    {
-        Placeholder = "Host name",
-        Text = Session.Name
-    };
-
-    private readonly Entry name = new()
-    {
-        Placeholder = "Event name"
-    };
-
-    private readonly Entry address = new()
-    {
-        Placeholder = "Event address"
-    };
-
-    private readonly Entry capacity = new()
-    {
-        Placeholder = "Maximum attendees",
-        Keyboard = Keyboard.Numeric
-    };
-
-    private readonly DatePicker date = new()
-    {
-        Date = DateTime.Today.AddDays(14)
-    };
-
-    private readonly TimePicker time = new()
-    {
-        Time = new TimeSpan(18, 0, 0)
-    };
-
-    private readonly DatePicker deadline = new()
-    {
-        Date = DateTime.Today.AddDays(12)
-    };
-
     public AddEventPage()
     {
         Title = "Add Event";
@@ -737,179 +711,278 @@ public class AddEventPage : ContentPage
         stack.Children.Add(
             Ui.Heading("Create Event"));
 
-        Ui.AddField(stack, "Host Name", host);
-        Ui.AddField(stack, "Event Name", name);
-        Ui.AddField(stack, "Address", address);
-        Ui.AddField(stack, "Maximum Attendees", capacity);
-        Ui.AddField(stack, "Event Date", date);
-        Ui.AddField(stack, "Event Time", time);
-        Ui.AddField(stack, "RSVP Deadline", deadline);
+        var name = Ui.Entry("Event name");
+        var address = Ui.Entry("Address");
+        var description = Ui.Entry("Description");
+        var capacity = Ui.Entry("Maximum attendees");
+
+        capacity.Keyboard = Keyboard.Numeric;
+
+        var date = new DatePicker
+        {
+            Date = DateTime.Today.AddDays(14)
+        };
+
+        var time = new TimePicker
+        {
+            Time = new TimeSpan(18, 0, 0)
+        };
+
+        var deadline = new DatePicker
+        {
+            Date = DateTime.Today.AddDays(12)
+        };
+
+        stack.Children.Add(Ui.Text(
+            "Host: " +
+            (Store.CurrentUser?.Name ?? "Not logged in")));
+
+        Ui.Field(stack, "Event Name", name);
+        Ui.Field(stack, "Address", address);
+        Ui.Field(stack, "Description", description);
+        Ui.Field(stack, "Capacity", capacity);
+        Ui.Field(stack, "Event Date", date);
+        Ui.Field(stack, "Event Time", time);
+        Ui.Field(stack, "RSVP Deadline", deadline);
 
         stack.Children.Add(
-            Ui.Action("Save", Validate, true));
-
-        stack.Children.Add(
-            Ui.Action("Cancel", async () =>
+            Ui.Button("Save Event", async () =>
             {
+                if (Store.CurrentUser == null)
+                {
+                    await DisplayAlert(
+                        "Login Required",
+                        "Log in to host an event.",
+                        "OK");
+                    return;
+                }
+
+                if (Ui.Empty(
+                        name, address, description, capacity) ||
+                    !int.TryParse(
+                        capacity.Text, out int maximum) ||
+                    maximum < 1)
+                {
+                    await DisplayAlert(
+                        "Invalid",
+                        "Complete all fields and enter a positive capacity.",
+                        "OK");
+                    return;
+                }
+
+                // CORRECTED MAUI DATE/TIME CODE
+                // No HasValue or Value required.
+
+                DateTime eventDate =
+                    date.Date.Date.Add(time.Time);
+
+                DateTime limit =
+                    deadline.Date.Date;
+
+                if (eventDate <= DateTime.Now ||
+                    limit < DateTime.Today ||
+                    limit > eventDate.Date)
+                {
+                    await DisplayAlert(
+                        "Invalid Date",
+                        "Select a future event and valid RSVP deadline.",
+                        "OK");
+                    return;
+                }
+
+                await Store.AddEvent(new EventRecord
+                {
+                    HostUserId = Store.CurrentUser.Id,
+                    Name = name.Text!.Trim(),
+                    Address = address.Text!.Trim(),
+                    Description = description.Text!.Trim(),
+                    Capacity = maximum,
+                    Date = eventDate,
+                    Deadline = limit
+                });
+
+                await DisplayAlert(
+                    "Saved",
+                    "Event saved in SQLite.",
+                    "OK");
+
                 await Navigation.PopAsync();
-            }));
+            }, true));
 
-        Content = Ui.Form(stack);
-    }
+        stack.Children.Add(
+            Ui.Button("Cancel", async () =>
+                await Navigation.PopAsync()));
 
-    private async void Validate()
-    {
-        if (Ui.Missing(host, name, address, capacity))
-        {
-            await DisplayAlert(
-                "Missing Information",
-                "Complete all event fields.",
-                "OK");
-
-            return;
-        }
-
-        if (!int.TryParse(capacity.Text, out int maximum)
-            || maximum < 1)
-        {
-            await DisplayAlert(
-                "Invalid Capacity",
-                "Maximum attendees must be a whole number greater than zero.",
-                "OK");
-
-            return;
-        }
-
-        DateTime? selectedDate = date.Date;
-        TimeSpan? selectedTime = time.Time;
-        DateTime? selectedDeadline = deadline.Date;
-
-        if (!selectedDate.HasValue
-            || !selectedTime.HasValue
-            || !selectedDeadline.HasValue)
-        {
-            await DisplayAlert(
-                "Missing Information",
-                "Select the event date, time, and RSVP deadline.",
-                "OK");
-
-            return;
-        }
-
-        DateTime eventDate = selectedDate.Value.Date
-            .Add(selectedTime.Value);
-
-        if (eventDate <= DateTime.Now)
-        {
-            await DisplayAlert(
-                "Invalid Date",
-                "Choose a future event date and time.",
-                "OK");
-
-            return;
-        }
-
-        if (selectedDeadline.Value.Date > eventDate.Date)
-        {
-            await DisplayAlert(
-                "Invalid Deadline",
-                "The RSVP deadline cannot be after the event date.",
-                "OK");
-
-            return;
-        }
-
-        await DisplayAlert(
-            "Validation Successful",
-            "All event fields are complete. Event saving will be added later.",
-            "OK");
-
-        await Navigation.PopAsync();
+        Content = Ui.View(stack);
     }
 }
 
-// RSVP FORM
+// EVENT DETAILS
+
+public class EventDetailsPage : ContentPage
+{
+    public EventDetailsPage(EventRecord ev)
+    {
+        Title = "Event Details";
+
+        var stack = Ui.Stack();
+
+        Content = Ui.View(stack);
+
+        _ = Load();
+
+        async Task Load()
+        {
+            stack.Children.Clear();
+
+            stack.Children.Add(Ui.Placeholder());
+            stack.Children.Add(Ui.Heading(ev.Name));
+            stack.Children.Add(Ui.Text(ev.Description));
+
+            stack.Children.Add(Ui.Text(
+                "Host: " +
+                await Store.HostName(ev.HostUserId)));
+
+            stack.Children.Add(Ui.Text(
+                "Address: " + ev.Address));
+
+            stack.Children.Add(Ui.Text(
+                "Date: " +
+                ev.Date.ToString(
+                    "MMMM d, yyyy • h:mm tt")));
+
+            stack.Children.Add(Ui.Text(
+                "RSVP deadline: " +
+                ev.Deadline.ToString("MMMM d, yyyy")));
+
+            var accepted = (await Store.Rsvps(ev.Id))
+                .Where(x => x.Status == "Accepted")
+                .ToList();
+
+            stack.Children.Add(Ui.Text(
+                $"Attendees: {accepted.Count} / {ev.Capacity}"));
+
+            foreach (var person in accepted)
+            {
+                stack.Children.Add(Ui.Text(
+                    "✓ " + person.Name + " — Accepted"));
+            }
+
+            if (ev.Date <= DateTime.Now)
+            {
+                stack.Children.Add(
+                    Ui.Text("Event ended"));
+            }
+            else if (ev.Deadline.Date < DateTime.Today)
+            {
+                stack.Children.Add(
+                    Ui.Text("RSVP closed"));
+            }
+            else if (
+                accepted.Count >= ev.Capacity &&
+                !accepted.Any(x =>
+                    x.UserId > 0 &&
+                    x.UserId == Store.CurrentUser?.Id))
+            {
+                stack.Children.Add(
+                    Ui.Text("Event full"));
+            }
+            else
+            {
+                stack.Children.Add(
+                    Ui.Button("RSVP", async () =>
+                        await Navigation.PushAsync(
+                            new RsvpPage(ev)), true));
+            }
+
+            stack.Children.Add(
+                Ui.Button("Back", async () =>
+                    await Navigation.PopAsync()));
+        }
+    }
+}
+
+// RSVP PAGE
+
 public class RsvpPage : ContentPage
 {
-    private readonly Entry name = new()
-    {
-        Placeholder = "Full name"
-    };
-
-    private readonly Entry email = new()
-    {
-        Placeholder = "Email",
-        Keyboard = Keyboard.Email
-    };
-
-    private readonly Entry phone = new()
-    {
-        Placeholder = "Mobile phone",
-        Keyboard = Keyboard.Telephone
-    };
-
-    public RsvpPage(EventInfo item)
+    public RsvpPage(EventRecord ev)
     {
         Title = "RSVP";
-
-        if (!Session.IsGuest)
-        {
-            name.Text = Session.Name;
-            email.Text = Session.Email;
-            phone.Text = Session.Phone;
-        }
 
         var stack = Ui.Stack();
 
         stack.Children.Add(
-            Ui.Heading("RSVP for an Event"));
+            Ui.Heading("RSVP for " + ev.Name));
 
-        stack.Children.Add(new Label
+        var name = Ui.Entry("Name");
+        var email = Ui.Entry("Email");
+        var phone = Ui.Entry("Phone");
+
+        if (Store.CurrentUser is { } user)
         {
-            Text = item.Name
-        });
+            name.Text = user.Name;
+            email.Text = user.Email;
+            phone.Text = user.Phone;
 
-        Ui.AddField(stack, "Name", name);
-        Ui.AddField(stack, "Email", email);
-        Ui.AddField(stack, "Mobile Phone", phone);
-
-        stack.Children.Add(
-            Ui.Action("Save RSVP", Validate, true));
-
-        stack.Children.Add(
-            Ui.Action("Cancel", async () =>
-            {
-                await Navigation.PopAsync();
-            }));
-
-        Content = Ui.Form(stack);
-    }
-
-    private async void Validate()
-    {
-        if (Ui.Missing(name, email, phone))
-        {
-            await DisplayAlert(
-                "Missing Information",
-                "Complete all RSVP fields.",
-                "OK");
-
-            return;
+            name.IsReadOnly = true;
+            email.IsReadOnly = true;
+            phone.IsReadOnly = true;
         }
 
-        await DisplayAlert(
-            "Validation Successful",
-            "All RSVP fields are complete. Attendance has not been changed. " +
-            "RSVP saving will be added later.",
-            "OK");
+        Ui.Field(stack, "Name", name);
+        Ui.Field(stack, "Email", email);
+        Ui.Field(stack, "Mobile Phone", phone);
 
-        await Navigation.PopAsync();
+        stack.Children.Add(
+            Ui.Button("Save RSVP", async () =>
+            {
+                if (Ui.Empty(name, email, phone) ||
+                    !email.Text!.Contains('@'))
+                {
+                    await DisplayAlert(
+                        "Invalid",
+                        "Enter a name, email, and phone.",
+                        "OK");
+                    return;
+                }
+
+                var error = await Store.SaveRsvp(
+                    ev,
+                    name.Text!,
+                    email.Text!,
+                    phone.Text!);
+
+                if (error != null)
+                {
+                    await DisplayAlert(
+                        "Cannot RSVP", error, "OK");
+                    return;
+                }
+
+                await DisplayAlert(
+                    "Saved",
+                    "Your RSVP was saved to SQLite.",
+                    "OK");
+
+                await Navigation.PopAsync();
+            }, true));
+
+        stack.Children.Add(
+            Ui.Button("Cancel", async () =>
+                await Navigation.PopAsync()));
+
+        Content = Ui.View(stack);
     }
 }
 
-// INVITATION MANAGEMENT TAB
+// INVITATION MANAGEMENT
+
 public class InvitationsPage : ContentPage
 {
+    private readonly VerticalStackLayout list =
+        new() { Spacing = 12 };
+
     public InvitationsPage()
     {
         Title = "RSVPs";
@@ -919,80 +992,106 @@ public class InvitationsPage : ContentPage
         stack.Children.Add(
             Ui.Heading("Manage Invitations"));
 
-        if (Session.IsGuest)
+        stack.Children.Add(list);
+
+        Content = Ui.View(stack);
+    }
+
+    protected override async void OnAppearing()
+    {
+        base.OnAppearing();
+
+        list.Children.Clear();
+
+        if (Store.Guest)
         {
-            stack.Children.Add(new Label
-            {
-                Text = "Log in to view invitations for events you host."
-            });
-        }
-        else
-        {
-            foreach (var item in SampleData.Events.Where(
-                item => item.Hosting && item.Date >= DateTime.Now))
-            {
-                stack.Children.Add(
-                    Ui.Action(item.Name, async () =>
-                    {
-                        await Navigation.PushAsync(
-                            new InvitationDetailsPage(item));
-                    }));
-            }
+            list.Children.Add(Ui.Text(
+                "Log in to view RSVPs for events you host."));
+            return;
         }
 
-        Content = Ui.Form(stack);
+        var all = await Store.Events();
+
+        var hosted = all.Where(x =>
+            x.HostUserId == Store.CurrentUser!.Id &&
+            x.Date >= DateTime.Now)
+            .ToList();
+
+        if (hosted.Count == 0)
+        {
+            list.Children.Add(
+                Ui.Text("No upcoming hosted events."));
+        }
+
+        foreach (var ev in hosted)
+        {
+            list.Children.Add(
+                Ui.Button(ev.Name, async () =>
+                    await Navigation.PushAsync(
+                        new InvitationDetailsPage(ev))));
+        }
     }
 }
 
 // INVITATION DETAILS
+
 public class InvitationDetailsPage : ContentPage
 {
-    public InvitationDetailsPage(EventInfo item)
+    public InvitationDetailsPage(EventRecord ev)
     {
         Title = "Invitations";
 
         var stack = Ui.Stack();
 
         stack.Children.Add(
-            Ui.Heading(item.Name));
+            Ui.Heading(ev.Name));
 
-        stack.Children.Add(
-            Ui.FieldLabel("Pending"));
+        Content = Ui.View(stack);
 
-        foreach (string person in item.Pending)
+        _ = Load();
+
+        async Task Load()
         {
-            stack.Children.Add(new Label
+            var rsvps = await Store.Rsvps(ev.Id);
+
+            stack.Children.Add(
+                Ui.Heading("Pending"));
+
+            foreach (var record in rsvps.Where(
+                x => x.Status == "Pending"))
             {
-                Text = $"… {person} — Pending",
-                TextColor = Colors.Gray
-            });
+                stack.Children.Add(Ui.Text(
+                    "… " + record.Name + " — Pending"));
+            }
+
+            if (!rsvps.Any(
+                x => x.Status == "Pending"))
+            {
+                stack.Children.Add(
+                    Ui.Text("No pending invitations."));
+            }
+
+            stack.Children.Add(
+                Ui.Heading("Accepted"));
+
+            foreach (var record in rsvps.Where(
+                x => x.Status == "Accepted"))
+            {
+                stack.Children.Add(Ui.Text(
+                    "✓ " + record.Name + " — Accepted"));
+            }
+
+            if (!rsvps.Any(
+                x => x.Status == "Accepted"))
+            {
+                stack.Children.Add(
+                    Ui.Text("No accepted RSVPs yet."));
+            }
+
+            stack.Children.Add(
+                Ui.Button("Event Details", async () =>
+                    await Navigation.PushAsync(
+                        new EventDetailsPage(ev))));
         }
-
-        stack.Children.Add(
-            Ui.FieldLabel("Accepted"));
-
-        foreach (string person in item.Accepted)
-        {
-            stack.Children.Add(new Label
-            {
-                Text = $"✓ {person} — Accepted",
-                TextColor = Color.FromArgb("#218653")
-            });
-        }
-
-        stack.Children.Add(
-            Ui.Action("Event Details", async () =>
-            {
-                await Navigation.PushAsync(
-                    new EventDetailsPage(item));
-            }));
-
-        stack.Children.Add(
-            Ui.Action("Back", async () =>
-            {
-                await Navigation.PopAsync();
-            }));
-
-        Content = Ui.Form(stack);
     }
 }
