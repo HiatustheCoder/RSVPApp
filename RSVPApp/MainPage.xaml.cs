@@ -156,11 +156,11 @@ public static class Store
     {
         var db = await Db();
 
-        var user = await db.Table<UserRecord>()
-            .Where(x =>
-                x.Email == email.Trim().ToLowerInvariant())
-            .FirstOrDefaultAsync();
+        var normalizedEmail = email.Trim().ToLowerInvariant();
 
+        var user = await db.Table<UserRecord>()
+            .Where(x => x.Email == normalizedEmail)
+            .FirstOrDefaultAsync();
         if (user == null)
             return false;
 
