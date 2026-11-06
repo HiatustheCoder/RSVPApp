@@ -548,6 +548,7 @@ public class HomePage : TabbedPage
         Children.Add(new EventsPage());
         Children.Add(new InvitationsPage());
         Children.Add(new EventsPage(true));
+        Children.Add(new RemoteEventsPage());
     }
 }
 
